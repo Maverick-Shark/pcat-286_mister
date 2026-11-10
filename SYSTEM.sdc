@@ -52,6 +52,8 @@ set AT_VIDEO_X2 [at_clock {emu|u_at_video_pll|pll_system_inst|altera_pll_i|gener
 set AT_VIDEO_OUT [at_clock {emu|u_at_video_pll|pll_system_inst|altera_pll_i|general[2].gpll~PLL_OUTPUT_COUNTER|divclk}]
 set AT_HDMI [at_clock {pll_hdmi|pll_hdmi_inst|altera_pll_i|cyclonev_pll|counter[0].output_counter|divclk}]
 
+# The Chameleon96 has neither the SDRAM connector nor the SDIO/analog pins.
+if {![info exists mister_ch96] || !$mister_ch96} {
 create_generated_clock -name SDRAM_CLK -source [get_ports FPGA_CLK2_50] -divide_by 1 [get_ports SDRAM_CLK]
 create_clock -name VCLK_SDIO -period 20.000
 set_input_delay -clock SDRAM_CLK -max 8 [get_ports {SDRAM_DQ[*]}]
@@ -74,6 +76,7 @@ set_output_delay -clock VCLK_SDIO -min 0 [get_ports {SDIO_DAT[*] SDIO_CMD SDIO_C
 # those video paths; FPGA internal paths are not affected by these exclusions.
 foreach c [list $AT_VIDEO_OUT $AT_HDMI] {
     set_false_path -from $c -to [get_clocks VCLK_SDIO]
+}
 }
 
 # CPU <-> EGA I/O: one outstanding request, stable payload, toggle handshake.

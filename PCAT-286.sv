@@ -458,6 +458,10 @@ module emu_at
     // Forward the real 50 MHz clock through the dedicated DDR output cells.
     // High on rising edges, low on falling edges: no divide or phase shift.
     // A global clock routed as ordinary output data adds avoidable pin skew.
+`ifdef MISTER_CHAMELEON96
+    // No SDRAM connector: a DDR output cell needs a pin to drive.
+    assign SDRAM_CLK = 1'b0;
+`else
     altddio_out #(
         .extend_oe_disable("OFF"), .intended_device_family("Cyclone V"),
         .invert_output("OFF"), .lpm_hint("UNUSED"),
@@ -468,6 +472,7 @@ module emu_at
         .dataout(SDRAM_CLK), .aclr(1'b0), .aset(1'b0), .oe(1'b1),
         .outclocken(1'b1), .sclr(1'b0), .sset(1'b0)
     );
+`endif
     assign SDRAM_A   = sdram_address;
     assign SDRAM_CKE = sdram_cke;
     assign SDRAM_BA  = sdram_ba;
@@ -814,8 +819,19 @@ module emu_at
     wire [28:0] at_ddr_addr;
     wire [7:0]  at_ddr_be, at_ddr_burstcnt;
     wire [63:0] at_ddr_din, at_ddr_rdata;
+    // DDR3 placement, as 64-bit word addresses (byte address >> 3).
+`ifdef MISTER_CHAMELEON96
+    // 512 MiB board: Linux owns 0x00000000-0x0FFFFFFF and the device tree
+    // reserves 0x10000000-0x1FFFFFFF (no-map) for the FPGA. The MiSTer
+    // framebuffer (0x1D000000) and the scaler (0x1E800000) sit at its top.
+    localparam logic [28:0] AT_DDR_FB_BASE  = 29'h2000000; // byte 0x10000000
+    localparam logic [28:0] AT_DDR_RAM_BASE = 29'h2200000; // byte 0x11000000
+`else
+    localparam logic [28:0] AT_DDR_FB_BASE  = 29'h6000000; // byte 0x30000000
+    localparam logic [28:0] AT_DDR_RAM_BASE = 29'h6200000; // byte 0x31000000
+`endif
 `ifdef PCAT286_RAM_DDR3
-    spk286_at_mister_ddram_owner u_at_ddram_owner (
+    spk286_at_mister_ddram_owner #(.DDRAM_BASE(AT_DDR_RAM_BASE)) u_at_ddram_owner (
         .clk                    (CLK_50M),
         .reset                  (RESET),
         .request_valid          (posted_out_valid),
@@ -1443,7 +1459,7 @@ module emu_at
     wire        at_fb_frame_valid;
     wire [1:0]  at_fb_reading_buffer;
 
-    ega_fb_capture u_at_ega_fb_capture (
+    ega_fb_capture #(.BASE_ADDR(AT_DDR_FB_BASE)) u_at_ega_fb_capture (
         .clk            (at_video_clk_57),
         .reset          (at_video_pipe_reset_57),
         .enable         (at_video_crt350_enable),
@@ -1488,7 +1504,7 @@ module emu_at
     wire        at_fb_field;
     wire        at_fb_ce_pix;
 
-    ega_fb_readout u_at_ega_fb_readout (
+    ega_fb_readout #(.BASE_ADDR(AT_DDR_FB_BASE)) u_at_ega_fb_readout (
         .clk            (at_video_clk_57),
         .reset          (at_video_pipe_reset_57),
         .enable         (at_video_crt350_enable),
