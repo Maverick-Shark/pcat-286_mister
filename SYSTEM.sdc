@@ -42,9 +42,11 @@ proc at_mailbox {label source_clock patterns budget} {
 set AT_CPU [at_clock FPGA_CLK2_50]
 set at_boot_splash_enabled 0
 set at_ram_ddr3_enabled 0
+set at_ch96 0
 foreach_in_collection a [get_all_global_assignments -name VERILOG_MACRO] {
     if {[lindex $a 2] eq "SPK286_AT_BOOT_SPLASH"} { set at_boot_splash_enabled 1 }
     if {[string match "PCAT286_RAM_DDR3*" [lindex $a 2]]} { set at_ram_ddr3_enabled 1 }
+    if {[lindex $a 2] eq "MISTER_CHAMELEON96"} { set at_ch96 1 }
 }
 
 set AT_VIDEO [at_clock {emu|u_at_video_pll|pll_system_inst|altera_pll_i|general[0].gpll~PLL_OUTPUT_COUNTER|divclk}]
@@ -53,7 +55,7 @@ set AT_VIDEO_OUT [at_clock {emu|u_at_video_pll|pll_system_inst|altera_pll_i|gene
 set AT_HDMI [at_clock {pll_hdmi|pll_hdmi_inst|altera_pll_i|cyclonev_pll|counter[0].output_counter|divclk}]
 
 # The Chameleon96 has neither the SDRAM connector nor the SDIO/analog pins.
-if {![info exists mister_ch96] || !$mister_ch96} {
+if {!$at_ch96} {
 create_generated_clock -name SDRAM_CLK -source [get_ports FPGA_CLK2_50] -divide_by 1 [get_ports SDRAM_CLK]
 create_clock -name VCLK_SDIO -period 20.000
 set_input_delay -clock SDRAM_CLK -max 8 [get_ports {SDRAM_DQ[*]}]
@@ -224,7 +226,10 @@ if {$at_cdc_enabled && $at_require_new} {
     # Geometry plus the applied EGA monitor profile form a 16-bit held bus.
     # Its destination is 28.636 MHz; 10 ns leaves ample settling time.
     at_snapshot video_geometry_cdc 10.0
-    at_snapshot at_crt350_config_cdc 10.0
+    # The 350-line CRT conversion is not built for the Chameleon96.
+    if {!$at_ch96} {
+        at_snapshot at_crt350_config_cdc 10.0
+    }
     # Completed HPS display/scale/aspect fields apply locally in vertical blank.
     at_snapshot u_at_video_options*config_mailbox 10.0
     # Applied scanline intensity returns as a coherent pair for HPS readback.

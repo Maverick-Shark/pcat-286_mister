@@ -63,8 +63,15 @@ module emu_at
     // MPU-401 is the AT card at 330h; USER I/O selects the physical MIDI
     // cable or the COM2 pins, while the h3P4 entries configure the external
     // MT32-pi bridge and its LCD/status protocol.
+`ifdef MISTER_CHAMELEON96
+    // No USER I/O port on the Chameleon96: MIDI and COM2 go through the
+    // MiSTer UART only and there is no MT32-pi, so only MPU-401 remains.
+    localparam CONF_STR_MIDI = (`ENABLE_MIDI ?
+        "P3oO,MPU-401,Enabled,Disabled;" : "");
+`else
     localparam CONF_STR_MIDI = (`ENABLE_MIDI ?
         "P3oO,MPU-401,Enabled,Disabled;P3-;P3O6,USER I/O,MIDI,COM2;P3-;h3P4,MT32-pi;h3P4-;h3P4OD,Use MT32-pi,Yes,No;h3P4-;h3P4o9,MT32-pi Mode,MT-32,General MIDI;h3P4O34,MT32-pi ROM,MT-32 v1,MT-32 v2,CM-32L,Reserved;h3P4oSU,MT32-pi SoundFont,#0,#1,#2,#3,#4,#5,#6,#7;h3P4-;h3P4r8,Reset Hanging Notes;h3P4-;" : "");
+`endif
 
     localparam CONF_STR_SYSTEM = "PCAT-286;";
     localparam CONF_STR_UART = (`ENABLE_MIDI ?
@@ -81,7 +88,9 @@ module emu_at
         "-;",
         "S2,VHD,IDE 0-0;",
         "S3,VHD,IDE 0-1;",
+`ifndef MISTER_CHAMELEON96
         "OLM,2nd SD card,Disable,IDE 0-0,IDE 0-1;",
+`endif
         "-;",
         "O[77:75],CPU Speed,MAX,6 MHz,8 MHz,10 MHz,12.5 MHz,16 MHz,20 MHz,25 MHz;",
         "-;",
@@ -113,7 +122,9 @@ module emu_at
         "P2O89,Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
         "P2OEG,Display,Full Color,Green,Amber,B&W,Red,Blue,Fuchsia,Purple;",
         "P2OA,VGA 13h+ CRT,Native 70Hz,TV 60Hz;",
+`ifndef MISTER_CHAMELEON96
         "P2o23,350-line CRT,Native,480i 15 kHz,240p 15 kHz;",
+`endif
         "P2-;",
         "P3,Hardware;",
         "P3-;",
@@ -357,8 +368,15 @@ module emu_at
     // UART and otherwise leaves MPU-401 MIDI on the external USER I/O cable.
     // USER I/O can also expose COM2, matching the original option exactly.
     wire hps_midi = (`ENABLE_MIDI) && (uart_mode >= 8'd3);
+`ifdef MISTER_CHAMELEON96
+    // No USER I/O port: COM2 always takes its inputs from the MiSTer UART
+    // and the MT32-pi bridge is not used (a stale O6 bit cannot select it).
+    wire user_io_mt32 = 1'b0;
+    wire user_io_com2 = 1'b0;
+`else
     wire user_io_mt32 = (`ENABLE_MIDI) && !hps_status[6];
     wire user_io_com2 = (`ENABLE_MIDI) && hps_status[6];
+`endif
     wire mt32_disable = hps_status[13];
     wire [6:0] mt32_user_out;
     wire       mt32_pi_midi_rx;
@@ -828,9 +846,15 @@ module emu_at
     wire [63:0] at_ddr_din, at_ddr_rdata;
     // DDR3 placement, as 64-bit word addresses (byte address >> 3).
 `ifdef MISTER_CHAMELEON96
-    // 512 MiB board: Linux owns 0x00000000-0x0FFFFFFF and the device tree
-    // reserves 0x10000000-0x1FFFFFFF (no-map) for the FPGA. The MiSTer
-    // framebuffer (0x1D000000) and the scaler (0x1E800000) sit at its top.
+    // 512 MiB board (see DDR_MAP.md of the Chameleon96 project): Linux owns
+    // 0x00000000-0x0FFFFFFF; the device tree reserves 0x10000000-0x1FFFFFFF
+    // (no-map). 0x10000000-0x1B7FFFFF is the ao486 window, idle on every
+    // other RBF; the C64 GCR shadow (0x1B800000), the menu LFB palette
+    // (0x1CFFF000), the LFB (0x1D000000) and the scaler (0x1E800000) sit
+    // above it. The AT RAM keeps the DE10 offsets modulo 512 MiB: the owner's
+    // 25-bit address spans at most 32 MiB (0x11000000-0x12FFFFFF), and
+    // Main_MiSTer's x86 share poll (0x100CE000, also run for this core)
+    // stays outside it. The 350-line CRT framebuffer is not built here.
     localparam logic [28:0] AT_DDR_FB_BASE  = 29'h2000000; // byte 0x10000000
     localparam logic [28:0] AT_DDR_RAM_BASE = 29'h2200000; // byte 0x11000000
 `else
@@ -1012,7 +1036,11 @@ module emu_at
         if (RESET)
             at_use_mmc_q <= 2'b00;
         else if (at_boot_reset)
+`ifdef MISTER_CHAMELEON96
+            at_use_mmc_q <= 2'b00;  // no secondary SD slot on this board
+`else
             at_use_mmc_q <= hps_status[22:21];
+`endif
     end
 
     // Keep the AT splash lifetime aligned with the XT profile.  Previously
@@ -1425,6 +1453,13 @@ module emu_at
         end
     end
 
+`ifdef MISTER_CHAMELEON96
+    // The Chameleon96 has no analog video output, so the 15 kHz conversion
+    // of the 350-line modes (capture to DDR3 plus a 240p/480i raster read
+    // back from it) is not built: the native raster goes straight to the
+    // scaler and the ram1 port serves the AT RAM alone.
+    wire       at_video_crt350_enable = 1'b0;
+`else
     // 0 keeps the native EGA raster, 1 converts the captured frame to 480i,
     // and 2 converts it to 240p. The framebuffer is used only when the EGA
     // CRTC is actually producing a 350-line mode.
@@ -1453,6 +1488,7 @@ module emu_at
     wire       at_video_crt350_enable = at_video_mode350_s2_q &
                                          (|at_video_crt350_mode);
     wire       at_video_crt350_progressive = at_video_crt350_mode[1];
+`endif
 
     wire [7:0]  at_fb_cap_burstcnt;
     wire [28:0] at_fb_cap_addr;
@@ -1466,6 +1502,18 @@ module emu_at
     wire        at_fb_frame_valid;
     wire [1:0]  at_fb_reading_buffer;
 
+`ifdef MISTER_CHAMELEON96
+    // No capture: the arbiter's write client stays idle.
+    assign at_fb_cap_burstcnt = 8'd0;
+    assign at_fb_cap_addr     = 29'd0;
+    assign at_fb_cap_din      = 64'd0;
+    assign at_fb_cap_we       = 1'b0;
+    assign at_fb_frame_buffer = 2'd0;
+    assign at_fb_frame_width  = 12'd0;
+    assign at_fb_frame_height = 10'd0;
+    assign at_fb_frame_stride = 14'd0;
+    assign at_fb_frame_valid  = 1'b0;
+`else
     ega_fb_capture #(.BASE_ADDR(AT_DDR_FB_BASE)) u_at_ega_fb_capture (
         .clk            (at_video_clk_57),
         .reset          (at_video_pipe_reset_57),
@@ -1493,6 +1541,7 @@ module emu_at
         .frame_valid    (at_fb_frame_valid),
         .overrun        ()
     );
+`endif
 
     wire        at_fb_rd_req;
     wire [28:0] at_fb_rd_addr;
@@ -1511,6 +1560,24 @@ module emu_at
     wire        at_fb_field;
     wire        at_fb_ce_pix;
 
+`ifdef MISTER_CHAMELEON96
+    // No readout: the arbiter's read client stays idle and the video source
+    // below is always the native raster.
+    assign at_fb_rd_req         = 1'b0;
+    assign at_fb_rd_addr        = 29'd0;
+    assign at_fb_rd_burstcnt    = 8'd0;
+    assign at_fb_r              = 8'd0;
+    assign at_fb_g              = 8'd0;
+    assign at_fb_b              = 8'd0;
+    assign at_fb_hs             = 1'b0;
+    assign at_fb_vs             = 1'b0;
+    assign at_fb_hb             = 1'b1;
+    assign at_fb_vb             = 1'b1;
+    assign at_fb_de             = 1'b0;
+    assign at_fb_field          = 1'b0;
+    assign at_fb_ce_pix         = 1'b0;
+    assign at_fb_reading_buffer = 2'd0;
+`else
     ega_fb_readout #(.BASE_ADDR(AT_DDR_FB_BASE)) u_at_ega_fb_readout (
         .clk            (at_video_clk_57),
         .reset          (at_video_pipe_reset_57),
@@ -1541,6 +1608,7 @@ module emu_at
         .ce_pix         (at_fb_ce_pix),
         .reading_buffer (at_fb_reading_buffer)
     );
+`endif
 
     assign DDRAM_CLK = at_video_clk_57;
     ega_ddr_arbiter u_at_ega_ddr_arbiter (
@@ -1578,6 +1646,9 @@ module emu_at
         .at_rdata        (at_ddr_rdata)
     );
 
+`ifdef MISTER_CHAMELEON96
+    wire at_video_crt350_active = 1'b0;
+`else
     wire at_video_crt350_active;
     video_source_switch u_at_video_crt350_switch (
         .clock         (at_video_clk_57),
@@ -1589,6 +1660,7 @@ module emu_at
         .alt_vblank    (at_fb_vb),
         .alt_active    (at_video_crt350_active)
     );
+`endif
 
     wire [7:0] at_video_src_r = at_video_crt350_active ? at_fb_r : at_video_mono_r;
     wire [7:0] at_video_src_g = at_video_crt350_active ? at_fb_g : at_video_mono_g;

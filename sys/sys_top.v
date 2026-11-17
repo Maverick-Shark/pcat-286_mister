@@ -185,12 +185,27 @@ wire        ADC_SDO = 1'b0;
 wire  [1:0] KEY = 2'b11;
 wire  [3:0] SW  = 4'b0000;
 
-// LED[6,4,2,0] -> user LEDs D5-D8 on HPS GPIO (LoanIO in the board handoff),
-// LED[1]/LED[3] -> RF LEDs. All active high.
+// Fan: fixed ~50 % PWM at 50 MHz / 2^20 (about 48 Hz), as in teiram's
+// Template_MiSTer_ch96. It needs a preloader that lends HPS GPIO49 to the
+// FPGA (hps-ch96 97e5fe4 or later); with an older one the fan is not driven.
+reg  [19:0] fan_cnt = 20'd0;
+reg         fan_pwm = 1'b0;
+always @(posedge clk_50m) begin
+	fan_cnt <= fan_cnt + 1'd1;
+	fan_pwm <= (fan_cnt > 20'd524288);
+end
+
+// HPS GPIOs lent to the FPGA by the hps-ch96 handoff (LoanIO):
+//   14/22/25/32 - user LEDs D5-D8 from LED[0]/[2]/[4]/[6], active high;
+//   49          - fan PWM.
+// LED[1]/LED[3] drive the RF LEDs on FPGA pins Y19/Y20.
 wire  [7:0] LED;
 wire [66:0] loan_io_in;
-wire [66:0] loan_io_out = {1'b0, 33'd0, LED[6], 6'd0, LED[4], 2'd0, LED[2], 7'd0, LED[0], 14'd0};
-wire [66:0] loan_io_oe  = {1'b0, 33'd0, 1'b1,   6'd0, 1'b1,   2'd0, 1'b1,   7'd0, 1'b1,   14'd0};
+wire [66:0] loan_io_out = ({66'd0, LED[0]}  << 14) | ({66'd0, LED[2]} << 22)
+                        | ({66'd0, LED[4]}  << 25) | ({66'd0, LED[6]} << 32)
+                        | ({66'd0, fan_pwm} << 49);
+wire [66:0] loan_io_oe  = (67'd1 << 14) | (67'd1 << 22) | (67'd1 << 25)
+                        | (67'd1 << 32) | (67'd1 << 49);
 cyclonev_hps_interface_loan_io loan_io_inst
 (
 	.loanio_in(loan_io_in),
@@ -1461,6 +1476,10 @@ cyclonev_hps_interface_peripheral_i2c hdmi_i2c
 		.AT_CDC(1)
 `else
 		.AT_CDC(0)
+`endif
+`ifdef MISTER_CHAMELEON96
+		// OSD tint used by the Chameleon96 framework (Template_MiSTer_ch96).
+		, .OSD_COLOR(3'd1)
 `endif
 	) hdmi_osd
 	(
