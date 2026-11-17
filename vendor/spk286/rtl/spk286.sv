@@ -159,6 +159,7 @@ module spk286 (
     logic [7:0] opcode_q;
     logic unsupported_q;
     logic is_prefix, prefix_accept, context_active, segment_override, lock_prefix, length_fault, extended_opcode_active;
+    logic lock_privilege_fault, prefix_fault;
     logic [1:0] override_segment, repeat_kind;
     logic io_transfer;
     logic [15:0] io_port;
@@ -261,7 +262,7 @@ module spk286 (
     logic [7:0] task_cache_dpl, task_cache_rpl;
     logic [2:0] alu_operation;
     logic result_write_allowed, internal_flags_write_en, alu_byte;
-    logic [15:0] decoded_flags_mask, decoded_undefined_mask;
+    logic [15:0] decoded_flags_mask;
     logic [15:0] internal_flags_write_data, internal_flags_write_mask;
     logic internal_task_flags_write;
     logic event_active, event_cancel, event_dispatch, event_request, event_software, event_needs_ack, event_external;
@@ -380,9 +381,8 @@ module spk286 (
     assign commit_allowed = !control_error;
     assign restart = redirect && commit_allowed;
     assign semantic_cancel = restart || event_cancel;
-    // EXT identifies an event external to the program, not every exception.
-    // Intel 286 PRM B-1 includes INTR/NMI, single step and NPX #NM/#9;
-    // software INT and instruction-generated protection faults keep EXT=0.
+    // EXT marks a fault raised while delivering any event other than a
+    // software INT n/INT3/INTO, as an Intel N80286-12 does (spk286_events).
     // The event controller retains the original provenance across exception
     // replacement, whose current kind/vector can be #GP/#DF.
     assign task_fault_external = event_active && event_external;
@@ -445,7 +445,9 @@ module spk286 (
     assign segment_address = selected_segment_base + {8'h00, (execute_enable ? service_offset : segment_offset)};
     always_comb begin
         operand_physical_address = segment_address;
-        if (vector_request) operand_physical_address = {8'd0, vector_offset};
+        // Real-mode vectors are read from the IDTR base, as on an Intel
+        // N80286-12.
+        if (vector_request) operand_physical_address = (protected_msw[0] ? 24'd0 : protected_idtr_base) + {8'd0, vector_offset};
         if (io_transfer) operand_physical_address = {8'd0, io_port};
         if (protected_call_stack_access) operand_physical_address = protected_call_stack_address;
         if (protected_tss_access) operand_physical_address = protected_tss_address;
@@ -476,8 +478,9 @@ module spk286 (
     // Keep real-mode hidden limits, vector/I-O overlap and LOADALL state exact.
     (* keep *) logic [3:0] operand_io_ranges, operand_address_ranges, operand_stack_ranges;
     (* keep *) logic [3:0] operand_regular_ranges, operand_vector_ranges;
-    (* keep *) logic [3:0] operand_system_ranges;
-    logic parallel_operand_within_limit, parallel_system_cache_fault;
+    (* keep *) logic [3:0] operand_system_word0, operand_system_word1, operand_system_word2;
+    logic parallel_operand_within_limit;
+    logic [2:0] parallel_system_cache_fault;
     genvar operand_cache_index;
     generate
     for (operand_cache_index = 0; operand_cache_index < 4; operand_cache_index = operand_cache_index + 1) begin : g_operand_cache_range
@@ -497,11 +500,15 @@ module spk286 (
             !protected_range_exceeded(operand_offset, cache_limit, cache_expand_down, operand_byte);
         assign operand_vector_ranges[operand_cache_index] =
             !protected_range_exceeded(io_transfer ? 16'd0 : vector_offset, 16'hFFFF, cache_expand_down, operand_byte);
-        // Six-byte table operands use the ordinary effective offset.
-        // Complete each cache's range comparison before the late index mux.
-        assign operand_system_ranges[operand_cache_index] = cache_expand_down ?
-            (operand_offset <= cache_limit || operand_offset > 16'hFFFA) :
-            ({1'b0, operand_offset} + 17'd5 > {1'b0, cache_limit});
+        // Table operands are three words, each checked with its own 16-bit
+        // wrapped offset (see spk286_micro_executor). Complete each cache's
+        // comparisons before the late index mux.
+        assign operand_system_word0[operand_cache_index] =
+            protected_range_exceeded(operand_offset, cache_limit, cache_expand_down, 1'b0);
+        assign operand_system_word1[operand_cache_index] =
+            protected_range_exceeded(operand_offset + 16'd2, cache_limit, cache_expand_down, 1'b0);
+        assign operand_system_word2[operand_cache_index] =
+            protected_range_exceeded(operand_offset + 16'd4, cache_limit, cache_expand_down, 1'b0);
     end
     endgenerate
     assign parallel_operand_within_limit =
@@ -511,7 +518,9 @@ module spk286 (
         address_override && !stack_request ? operand_address_ranges[selected_segment_index] :
         stack_request ? operand_stack_ranges[selected_segment_index] :
         operand_regular_ranges[selected_segment_index];
-    assign parallel_system_cache_fault = operand_system_ranges[selected_segment_index];
+    assign parallel_system_cache_fault = {operand_system_word2[selected_segment_index],
+                                          operand_system_word1[selected_segment_index],
+                                          operand_system_word0[selected_segment_index]};
     assign protected_call_range_fault = stack_request ?
         protected_range_exceeded(stack_offset, protected_call_stack_limit, protected_call_stack_expand_down, operand_byte) :
         address_override ? protected_range_exceeded(address_offset, protected_call_stack_limit, protected_call_stack_expand_down, operand_byte) :
@@ -530,6 +539,10 @@ module spk286 (
                                         (operand_write && !protected_segment_is_writable))) ||
                                       protected_selected_range_fault)));
     assign protected_access_ss_fault = protected_access_fault && service_segment == 2'd2;
+    // A data write past its segment limit; repeated string stores use it for
+    // their extra CX decrement.
+    logic protected_store_limit_fault, stack_limit_fault;
+    assign protected_store_limit_fault = protected_access_fault && protected_selected_range_fault && operand_write;
     assign protected_fetch_invalid = protected_msw[0] && protected_segment_protected[2'd1] &&
                                    (!protected_segment_valid[2'd1] || !protected_segment_present[2'd1] ||
                                     !protected_segment_access[1*8 + 3]);
@@ -845,9 +858,9 @@ module spk286 (
     assign loadall_start = operation_valid && micro_word == spk286_microcode_pkg::MC_LOADALL;
     assign operation_done = micro_end || executor_done || loadall_complete;
     assign opcode_start = decode_ready && !event_active && !event_request && !event_completed && !raw_retired &&
-                          !unsupported_q && queue_consume_valid && decode_supported && !is_prefix && !length_fault;
+                          !unsupported_q && queue_consume_valid && decode_supported && !is_prefix && !prefix_fault;
     assign prefix_accept = decode_ready && !event_active && !event_request && !event_completed && !raw_retired &&
-                           !unsupported_q && queue_consume_valid && is_prefix && !length_fault;
+                           !unsupported_q && queue_consume_valid && is_prefix && !prefix_fault;
     assign length_fault = !event_active && !raw_retired && !event_completed && instruction_bytes == 10 &&
                           (micro_active ? executor_byte_ready : decode_ready);
     // The next queue byte as the executor and the operand decoder see it.
@@ -858,6 +871,17 @@ module spk286 (
     logic consumer_byte_valid;
     assign consumer_byte_valid = queue_consume_valid &&
                                  !(!event_active && !raw_retired && !event_completed && instruction_bytes == 10);
+    // The LOCK prefix is IOPL-sensitive on the 80286: "#GP(0) if the current
+    // privilege level is bigger (less privileged) than the I/O privilege
+    // level" (Intel 210498, LOCK). It faults when the opcode arrives, before
+    // the instruction consumes anything. An opcode that is invalid, or that
+    // rejects the prefix outright with #UD (ARPL, CLTS), keeps its #UD: an
+    // invalid opcode comes before a privilege check.
+    assign lock_privilege_fault = lock_prefix && protected_msw[0] && current_cpl > debug_flags[13:12] &&
+                                  !event_active && !raw_retired && !event_completed && decode_ready &&
+                                  queue_consume_valid && !is_prefix && !opcode_invalid &&
+                                  !(extended_opcode_active ? queue_consume_data == 8'h06 : queue_consume_data == 8'h63);
+    assign prefix_fault = length_fault || lock_privilege_fault;
     spk286_instruction_context instruction_context (
         .clk(clk), .reset(reset), .cancel(semantic_cancel), .complete(raw_retired || event_completed),
         .consume(queue_consume_valid && queue_consume_ready && !event_active), .prefix_accept(prefix_accept),
@@ -903,7 +927,9 @@ module spk286 (
     spk286_micro_executor #(
         .USE_PARALLEL_SYSTEM_LIMIT(1'b1)
     ) micro_executor (
-        .parallel_system_limit_fault(parallel_system_cache_fault),
+        .parallel_system_word_fault(parallel_system_cache_fault),
+        .protected_store_limit_fault(protected_store_limit_fault),
+        .stack_limit_fault(stack_limit_fault),
         .clk(clk), .reset(reset), .cancel(semantic_cancel), .start(service_start),
         .operation_valid(operation_valid), .operation(micro_word), .operation_done(executor_done), .operation_retire(operation_retire), .dispatch_request(dispatch_request),
         .segment_pop_opcode(opcode_q == 8'h07 || opcode_q == 8'h17 || opcode_q == 8'h1F),
@@ -955,7 +981,7 @@ module spk286 (
         .software_event_request(software_request), .software_vector(software_vector),
         .halt_request(halt_request), .context_commit(context_commit),
         .vector_request(vector_request), .context_cs(context_cs), .vector_offset(vector_offset),
-        .decoded_flags_mask(decoded_flags_mask), .decoded_undefined_mask(decoded_undefined_mask),
+        .decoded_flags_mask(decoded_flags_mask),
         .flags_write_en(internal_flags_write_en), .flags_write_data(internal_flags_write_data),
         .flags_write_mask(internal_flags_write_mask),
         .protected_msw(protected_msw), .protected_gdtr_limit(protected_gdtr_limit), .protected_idtr_limit(protected_idtr_limit),
@@ -1036,8 +1062,7 @@ module spk286 (
 
     spk286_alu_decode alu_decode (
         .opcode(opcode_q), .group_extension(operand_reg), .operation(alu_operation),
-        .operand_byte(alu_byte), .reverse_operands(reverse_operands), .write_result(result_write_allowed), .flags_mask(decoded_flags_mask),
-        .undefined_mask(decoded_undefined_mask)
+        .operand_byte(alu_byte), .reverse_operands(reverse_operands), .write_result(result_write_allowed), .flags_mask(decoded_flags_mask)
     );
 
     spk286_operand_decode operand_decode (
@@ -1090,7 +1115,7 @@ module spk286 (
 
     // Decode and the executor share one byte-consumption interface. Unsupported
     // opcodes stay at its head. Redirect/control errors suppress both consumers.
-    assign queue_consume_ready = !length_fault && (prefix_accept || opcode_start || executor_byte_ready);
+    assign queue_consume_ready = !prefix_fault && (prefix_accept || opcode_start || executor_byte_ready);
 
     assign internal_ip_write_en = internal_redirect || (queue_consume_valid && queue_consume_ready);
     assign internal_ip_write_data = internal_redirect ? internal_target : debug_ip + 16'h0001;
@@ -1102,7 +1127,7 @@ module spk286 (
             unsupported_q <= 1'b0;
         end else if (operand_context_valid && micro_active && !event_active && !form_supported && !invalid_form) begin
             unsupported_q <= 1'b1;
-        end else if (decode_ready && !event_active && !event_request && !event_completed && !raw_retired && !unsupported_q && queue_consume_valid && !is_prefix && !length_fault) begin
+        end else if (decode_ready && !event_active && !event_request && !event_completed && !raw_retired && !unsupported_q && queue_consume_valid && !is_prefix && !prefix_fault) begin
             opcode_q <= queue_consume_data;
             if (decode_supported) begin destination_q <= decode_destination; source_index_q <= decode_source_index; end
             else unsupported_q <= 1'b1;
@@ -1163,11 +1188,11 @@ module spk286 (
     assign demanded_code_fault = execution_allowed && !event_active && !raw_retired && !event_completed &&
                                  !queue_consume_valid && !fetch_response_valid && !fetch_bus_valid && fetch_blocked &&
                                  (micro_active ? executor_byte_ready : decode_ready);
-    assign fault_request = range_fault || bounds_fault || arithmetic_fault || operand_blocked || invalid_form ||
+    assign fault_request = range_fault || stack_limit_fault || bounds_fault || arithmetic_fault || operand_blocked || invalid_form ||
                            invalid_opcode_fault || system_limit_fault || system_fault ||
-                           protected_access_fault || protected_fetch_fault || demanded_code_fault || length_fault || loadall_fault;
+                           protected_access_fault || protected_fetch_fault || demanded_code_fault || prefix_fault || loadall_fault;
     assign fault_vector = (invalid_form || invalid_opcode_fault) ? 8'd6 : loadall_fault ? loadall_fault_vector : system_fault ? system_fault_vector :
-                          (protected_access_ss_fault || ((system_limit_fault || range_fault) && protected_msw[0] && service_segment == 2'd2)) ? 8'd12 : protected_access_fault ? 8'd13 :
+                          (protected_access_ss_fault || stack_limit_fault || ((system_limit_fault || range_fault) && protected_msw[0] && service_segment == 2'd2)) ? 8'd12 : protected_access_fault ? 8'd13 :
                           protected_fetch_fault ? 8'd13 : bounds_fault ? 8'd5 : arithmetic_fault ? 8'd0 : 8'd13;
     // Error words: protected selector faults in the #TS/#NP/#SS/#GP
     // family carry one 16-bit error word.  Non-selector protected faults use
@@ -1183,7 +1208,7 @@ module spk286 (
     assign fault_error_valid = protected_msw[0] && !(invalid_form || invalid_opcode_fault) &&
                               (loadall_fault ? loadall_fault_has_error :
                                system_fault ? system_fault_has_error :
-                               (protected_access_ss_fault ||
+                               (protected_access_ss_fault || stack_limit_fault ||
                                 ((system_limit_fault || range_fault) && protected_msw[0] && service_segment == 2'd2) ||
                                 protected_access_fault || protected_fetch_fault || (!bounds_fault && !arithmetic_fault)));
     assign fault_error_code = system_fault ? system_fault_error_code :
