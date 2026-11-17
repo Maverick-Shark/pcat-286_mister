@@ -22,7 +22,10 @@ module spk286_profiled_micro_executor #(parameter bit USE_PARALLEL_SYSTEM_LIMIT 
     input  logic lock_prefix,
     input logic [15:0] target_read_data, effective_offset, address_base,
     input logic [15:0] segment_limit,
-    input logic segment_expand_down, parallel_system_limit_fault,
+    input logic segment_expand_down,
+    input logic [2:0] parallel_system_word_fault,
+    input logic protected_store_limit_fault,
+    output logic stack_limit_fault,
     input logic [15:0] stack_segment_limit,
     /* Only the expand-down bit is consumed by the current stack-range
        predicate; the remaining access bits stay in the segment cache. */
@@ -117,7 +120,7 @@ module spk286_profiled_micro_executor #(parameter bit USE_PARALLEL_SYSTEM_LIMIT 
     output logic protected_segment_commit_table_indicator2,
     output logic [1:0] protected_segment_commit_rpl2,
     input logic result_write_allowed,
-    input logic [15:0] decoded_flags_mask, decoded_undefined_mask,
+    input logic [15:0] decoded_flags_mask,
     output logic flags_write_en,
     output logic [15:0] flags_write_data, flags_write_mask,
     input logic [15:0] protected_msw,
@@ -219,8 +222,16 @@ module spk286_profiled_micro_executor #(parameter bit USE_PARALLEL_SYSTEM_LIMIT 
     assign string_continue = allowed && operation == spk286_microcode_pkg::MC_BRANCH_REPEAT_CONTINUE;
     assign string_again = repeat_kind != 0 && count_value != 0 &&
                           (!string_compare || (architectural_flags[6] == (repeat_kind == 2)));
-    assign repeat_boundary = (string_empty && repeat_kind != 0 && count_value != 0) || (string_continue && string_again);
-    assign repeat_stepped = string_continue && string_again;
+    // The iteration that exhausts CX still ends at an event boundary with IP
+    // at the instruction: an Intel N80286-12 takes INTR or the TF trap there
+    // with CX=0 and re-executes the REP as a no-op. A compare that ends the
+    // repeat does not.
+    logic string_exhausted;
+    assign string_exhausted = string_continue && repeat_kind != 0 && count_value == 0 &&
+                              (!string_compare || (architectural_flags[6] == (repeat_kind == 2)));
+    assign repeat_boundary = (string_empty && repeat_kind != 0 && count_value != 0) ||
+                             (string_continue && string_again) || string_exhausted;
+    assign repeat_stepped = (string_continue && string_again) || string_exhausted;
     assign string_step_source = implementation_allowed && operation == spk286_microcode_pkg::MC_STEP_STRING_SOURCE;
     assign string_step_dest = implementation_allowed && operation == spk286_microcode_pkg::MC_STEP_STRING_DEST;
     assign string_index_write = string_step_source || string_step_dest;
@@ -233,7 +244,10 @@ module spk286_profiled_micro_executor #(parameter bit USE_PARALLEL_SYSTEM_LIMIT 
     assign string_range_fault = string_store && !string_byte && address_offset == 16'hFFFF;
     // Pinned repeated store faults retain the next count decrement as well as
     // the attempted element's earlier decrement. This includes CX=1 -> FFFF.
-    assign string_count_write = repeat_kind != 0 && (string_count || string_range_fault);
+    // A protected-mode store past the ES limit does the same on an Intel
+    // N80286-12.
+    assign string_count_write = repeat_kind != 0 &&
+                                (string_count || string_range_fault || (string_store && protected_store_limit_fault));
     assign string_request = string_read0 || string_read1 || (string_store && !string_range_fault);
     assign string_read_acc = implementation_allowed && operation == spk286_microcode_pkg::MC_READ_STRING_ACCUMULATOR;
     assign string_write_acc = implementation_allowed && operation == spk286_microcode_pkg::MC_WRITE_STRING_ACCUMULATOR && temporary_valid_q[0];
@@ -254,7 +268,8 @@ module spk286_profiled_micro_executor #(parameter bit USE_PARALLEL_SYSTEM_LIMIT 
     logic begin_return_cursor, protected_return_cursor_q, return_same_sp_commit, add_allocation_arch;
     logic segment_pop_sp_commit;
     logic [15:0] stack_cursor_q, return_stack_pointer;
-    assign stack_arch_write = stack_write_sp && !(stack_cursor_valid_q || begin_return_cursor);
+    logic real_push_wrap, real_push_wrap_q;
+    assign stack_arch_write = (stack_write_sp || real_push_wrap) && !(stack_cursor_valid_q || begin_return_cursor);
     // Keep a tentative SP until protected returns or POP Sreg validate all
     // descriptors. A fault must leave the original SS:SP restartable.
     assign begin_return_cursor = protected_msw[0] && (check_pop2 ||
@@ -288,13 +303,31 @@ module spk286_profiled_micro_executor #(parameter bit USE_PARALLEL_SYSTEM_LIMIT 
                          (check_pop2 && stack_pointer[0] && stack_pointer>=16'hFFFD) || (check_push8 && push8_invalid) || (check_pop8 && pop8_invalid) ||
                          (check_stack_word && tmp0_q == 16'hFFFF) || iret_outer_range_fault ||
                          call_stack_range_fault;
-    assign range_fault = string_range_fault || stack_range_fault ||
+    // Protected mode, as on an Intel N80286-12:
+    // POPA checks all eight words against the SS limit before reading any,
+    // and ENTER checks the word at its final SP before committing SP and BP.
+    // Each word is checked with its own 16-bit wrapped offset.
+    logic allocate_stack_operation;
+    function automatic logic stack_word_exceeded(input logic [15:0] offset_value);
+        stack_word_exceeded = stack_segment_access[2] ?
+            (offset_value <= stack_segment_limit || offset_value == 16'hFFFF) :
+            (offset_value >= stack_segment_limit);
+    endfunction
+    logic [7:0] pop8_word_exceeded;
+    always_comb
+        for (integer word = 0; word < 8; word = word + 1)
+            pop8_word_exceeded[word] = stack_word_exceeded(stack_pointer + 16'(word * 2));
+    assign stack_limit_fault = protected_msw[0] &&
+                               ((check_pop8 && |pop8_word_exceeded) ||
+                                (allocate_stack_operation && stack_word_exceeded(stack_cursor_q - allocation_q)));
+    assign range_fault = string_range_fault || stack_range_fault || real_push_wrap_q ||
                          (check_rm32 && effective_offset[0] && effective_offset > 16'hFFFC);
     assign bounds_fault = check_bounds && ($signed(tmp1_q) < $signed(auxiliary_q) || $signed(tmp1_q) > $signed(tmp0_q));
     assign set_frame_address = implementation_allowed && operation == spk286_microcode_pkg::MC_SET_STACK_ADDRESS_TMP0 && temporary_valid_q[0];
     assign read_frame_address = implementation_allowed && operation == spk286_microcode_pkg::MC_READ_STACK_ADDRESS_TMP0 && frame_address_valid_q;
     assign decrement_frame_address = implementation_allowed && operation == spk286_microcode_pkg::MC_DECREMENT_STACK_ADDRESS && frame_address_valid_q;
-    assign allocate_stack = implementation_allowed && operation == spk286_microcode_pkg::MC_ALLOCATE_STACK && allocation_valid_q && stack_cursor_valid_q;
+    assign allocate_stack_operation = implementation_allowed && operation == spk286_microcode_pkg::MC_ALLOCATE_STACK && allocation_valid_q && stack_cursor_valid_q;
+    assign allocate_stack = allocate_stack_operation && !stack_limit_fault;
     assign set_ea_plus2 = implementation_allowed && operation == spk286_microcode_pkg::MC_SET_EA_PLUS2;
     // Finish the independent arithmetic before the late operation selector.
     // Keep these combinational boundaries to prevent an arithmetic-sharing
@@ -409,13 +442,25 @@ module spk286_profiled_micro_executor #(parameter bit USE_PARALLEL_SYSTEM_LIMIT 
     assign system_is_gdtr = operation == spk286_microcode_pkg::MC_SYSTEM_STORE_GDTR || operation == spk286_microcode_pkg::MC_SYSTEM_LOAD_GDTR;
     assign system_selected_limit = system_is_gdtr ? protected_gdtr_limit : protected_idtr_limit;
     assign system_selected_base = system_is_gdtr ? protected_gdtr_base : protected_idtr_base;
-    // Table operands span six bytes. Expand-down segments admit offsets
-    // above their limit, with the same non-wrapping 16-bit upper boundary.
+    // Table operands are three words, each checked on its own with the
+    // offset wrapping at 16 bits: a word may not cross the limit or start at
+    // FFFF.  SGDT/SIDT write the limit word first and only then check the two
+    // base words together, so a failing base leaves the limit written.  An
+    // Intel N80286-12 does exactly this.
+    function automatic logic system_word_exceeded(input logic [15:0] offset_value, limit_value,
+                                                  input logic expand_down);
+        system_word_exceeded = expand_down ? (offset_value <= limit_value || offset_value == 16'hFFFF) :
+                                             (offset_value > limit_value || offset_value == limit_value);
+    endfunction
+    logic [2:0] system_word_fault;
+    assign system_word_fault = USE_PARALLEL_SYSTEM_LIMIT ? parallel_system_word_fault :
+        {system_word_exceeded(effective_offset + 16'd4, segment_limit, segment_expand_down),
+         system_word_exceeded(effective_offset + 16'd2, segment_limit, segment_expand_down),
+         system_word_exceeded(effective_offset, segment_limit, segment_expand_down)};
     assign system_limit_fault = system_table_operation && !operand_register_direct &&
-                                (USE_PARALLEL_SYSTEM_LIMIT ? parallel_system_limit_fault : segment_expand_down ?
-                                 (effective_offset <= segment_limit ||
-                                  {1'b0, effective_offset} + 17'd5 > 17'h0FFFF) :
-                                 ({1'b0, effective_offset} + 17'd5 > {1'b0, segment_limit}));
+                                (system_table_store ?
+                                 (system_index_q == 2'd0 ? system_word_fault[0] : |system_word_fault[2:1]) :
+                                 |system_word_fault);
     assign system_begin = system_operation && !system_active_q && !system_limit_fault && !system_privilege_fault && !system_mode_fault;
     assign system_operand_request = system_active_q && system_operation && !system_limit_fault && !system_privilege_fault && !system_mode_fault;
     assign system_operand_write = system_operand_request && (system_table_store || system_msw_store || system_selector_store);
@@ -702,10 +747,11 @@ module spk286_profiled_micro_executor #(parameter bit USE_PARALLEL_SYSTEM_LIMIT 
         .gate_offset(descriptor_unused_gate_offset), .gate_parameter_count(descriptor_unused_gate_parameter_count)
     );
     logic descriptor_system_access_valid;
+    // LTR does not check the TSS limit: an Intel N80286-12 loads a TSS of
+    // limit 2Ah. Task switches still need 2Bh.
     assign descriptor_system_access_valid = descriptor_valid && descriptor_reserved_valid &&
                                      ((descriptor_load_ldtr && descriptor_class == spk286_protected_pkg::DESC_LDT) ||
-                                      (descriptor_load_tr && descriptor_class == spk286_protected_pkg::DESC_TSS_AVAIL &&
-                                       descriptor_limit >= spk286_tss_pkg::TSS_MIN_LIMIT));
+                                      (descriptor_load_tr && descriptor_class == spk286_protected_pkg::DESC_TSS_AVAIL));
     assign descriptor_success_live = descriptor_system_access_valid && descriptor_present;
     // A TSS named by a task gate is authorized by the gate itself.  This
     // applies to both far CALL/JMP task gates and IDT task gates; the target
@@ -768,10 +814,16 @@ module spk286_profiled_micro_executor #(parameter bit USE_PARALLEL_SYSTEM_LIMIT 
     assign descriptor_cs_candidate_success_live = call_gate_cs_validation_operation ? descriptor_call_gate_cs_success_live :
                                                    iret_cs_validation_operation ? descriptor_iret_cs_success_live : descriptor_cs_success_live;
     assign descriptor_effective_privilege = descriptor_unused_rpl > protected_cpl ? descriptor_unused_rpl : protected_cpl;
-    assign descriptor_verify_success_live = descriptor_valid && descriptor_reserved_valid && descriptor_present &&
+    // VERR does not check privilege on a conforming code segment: "If the
+    // code segment is readable and conforming, the descriptor privilege
+    // level (DPL) can be any value for VERR" (Intel, VERR/VERW). VERW never
+    // succeeds on code, so the exemption needs no read qualifier here.
+    // Neither instruction checks the present bit: an Intel N80286-12 sets ZF
+    // for absent readable (VERR) and writable (VERW) segments.
+    assign descriptor_verify_success_live = descriptor_valid && descriptor_reserved_valid &&
                                             descriptor_unused_segment &&
-                                            ((descriptor_unused_conforming && descriptor_unused_dpl <= protected_cpl) ||
-                                             (!descriptor_unused_conforming && descriptor_unused_dpl >= descriptor_effective_privilege)) &&
+                                            (descriptor_unused_conforming ||
+                                             descriptor_unused_dpl >= descriptor_effective_privilege) &&
                                             ((descriptor_verify_read &&
                                               ((descriptor_class == spk286_protected_pkg::DESC_CODE && descriptor_unused_readable) ||
                                                descriptor_class == spk286_protected_pkg::DESC_DATA ||
@@ -781,11 +833,17 @@ module spk286_profiled_micro_executor #(parameter bit USE_PARALLEL_SYSTEM_LIMIT 
                                                descriptor_class == spk286_protected_pkg::DESC_EXPAND_DOWN) && descriptor_unused_writable));
     // LAR/LSL inspect a visible descriptor even when its segment is absent.
     // In particular, Windows keeps loader metadata in an absent limit field.
+    // An Intel N80286-12 differs from the LAR and LSL pages of Intel 210498
+    // in three ways: conforming code passes whatever its DPL, LSL accepts
+    // conforming code, and LAR rejects interrupt and trap gates.
     assign descriptor_inspect_success_live = descriptor_valid && descriptor_reserved_valid &&
-                                             descriptor_unused_dpl >= descriptor_effective_privilege &&
-                                             (descriptor_load_access ||
+                                             (descriptor_unused_conforming ||
+                                              descriptor_unused_dpl >= descriptor_effective_privilege) &&
+                                             ((descriptor_load_access &&
+                                               descriptor_class != spk286_protected_pkg::DESC_INT_GATE &&
+                                               descriptor_class != spk286_protected_pkg::DESC_TRAP_GATE) ||
                                               (descriptor_load_limit &&
-                                               ((descriptor_unused_segment && !descriptor_unused_conforming) ||
+                                               (descriptor_unused_segment ||
                                                 descriptor_class == spk286_protected_pkg::DESC_TSS_AVAIL ||
                                                 descriptor_class == spk286_protected_pkg::DESC_TSS_BUSY ||
                                                 descriptor_class == spk286_protected_pkg::DESC_LDT)));
@@ -853,10 +911,13 @@ module spk286_profiled_micro_executor #(parameter bit USE_PARALLEL_SYSTEM_LIMIT 
                                    (iret_cs_validation_operation ?
                                    ((({1'b0, tmp0_q} > {1'b0, descriptor_limit}) && descriptor_iret_cs_success_live) || !descriptor_iret_cs_success_live) :
                                     (cs_validation_operation ?
+                                     // The selector in a task gate must name an available TSS
+                                     // (Intel 210498, JMP: "JUMP TASK GATE"), as it must for CALL.
+                                     (task_gate_target_active_q ? !task_descriptor_success_live :
                                      ((jmp_gate_probe_operation && descriptor_class == spk286_protected_pkg::DESC_CALL_GATE) ?
                                        !descriptor_call_gate_success_live :
                                       ((task_descriptor_success_live || task_gate_target_begin) ? 1'b0 :
-                                       (descriptor_cs_offset_fault || !descriptor_cs_success_live))) :
+                                       (descriptor_cs_offset_fault || !descriptor_cs_success_live)))) :
                                    (iret_ss_validation_operation ? !descriptor_iret_ss_success_live :
                                     (segment_reload_operation ? !descriptor_segment_success_live :
                                     (!descriptor_verify_operation && !descriptor_inspect_operation && !descriptor_success_live))))))));
@@ -868,7 +929,14 @@ module spk286_profiled_micro_executor #(parameter bit USE_PARALLEL_SYSTEM_LIMIT 
     assign event_gate_entry_offset = {5'd0, event_vector, 3'b000};
     assign event_gate_limit_fault = event_gate_begin &&
                                     ({1'b0, event_gate_entry_offset} + 17'd7 > {1'b0, protected_idtr_limit});
-    assign event_gate_pre_fault = event_gate_limit_fault;
+    // Real address mode: "Interrupt Table Limit Too Small (Interrupt 8) ... if
+    // the limit of the interrupt vector table was changed from 3FFH by the
+    // LIDT instruction and an interrupt whose vector is outside the limit
+    // occurs" (Intel 210498, 5.2.3). The entry is four bytes; no error code.
+    logic event_vector_limit_fault;
+    assign event_vector_limit_fault = event_gate_operation && !protected_msw[0] &&
+                                      ({7'd0, event_vector, 2'b00} + 17'd3 > {1'b0, protected_idtr_limit});
+    assign event_gate_pre_fault = event_gate_limit_fault || event_vector_limit_fault;
     assign event_gate_operand_done = event_gate_active_q && operand_done;
     assign event_gate_high_word_valid = event_gate_unused_segment ||
                                        ((event_gate_operand_done && event_gate_phase_q == 3'd3) ?
@@ -963,9 +1031,11 @@ module spk286_profiled_micro_executor #(parameter bit USE_PARALLEL_SYSTEM_LIMIT 
                                        (descriptor_cs_offset_fault || !descriptor_call_gate_cs_success_live || descriptor_unused_accessed)) ||
                                        (descriptor_operand_done && descriptor_phase_q == 3'd4 && call_gate_cs_validation_operation && descriptor_success_q) ||
                                       (descriptor_operand_done && descriptor_phase_q == 3'd3 && cs_validation_operation &&
-                                         (!task_gate_target_begin && !jmp_gate_target_begin && (task_descriptor_success_live ||
-                                          (!task_descriptor_success_live &&
-                                           (descriptor_cs_offset_fault || !descriptor_cs_success_live || descriptor_unused_accessed))))) ||
+                                         (!task_gate_target_begin && !jmp_gate_target_begin &&
+                                          (task_gate_target_active_q ? task_descriptor_success_live :
+                                           (task_descriptor_success_live ||
+                                            (!task_descriptor_success_live &&
+                                             (descriptor_cs_offset_fault || !descriptor_cs_success_live || descriptor_unused_accessed)))))) ||
                                       (descriptor_operand_done && descriptor_phase_q == 3'd4 && cs_validation_operation && descriptor_success_q) ||
                                       (descriptor_operand_done && descriptor_phase_q == 3'd3 && iret_cs_validation_operation &&
                                        ((({1'b0, tmp0_q} > {1'b0, descriptor_limit}) && descriptor_iret_cs_success_live) ||
@@ -992,7 +1062,7 @@ module spk286_profiled_micro_executor #(parameter bit USE_PARALLEL_SYSTEM_LIMIT 
                                               descriptor_class == spk286_protected_pkg::DESC_TASK_GATE ? task_gate_access_valid :
                                               descriptor_class == spk286_protected_pkg::DESC_CODE ? descriptor_cs_access_valid :
                                               task_descriptor_access_valid;
-    assign system_fault_vector = npx_fault ? 8'd7 : task_service_fault ? task_service_fault_vector : system_mode_fault ? 8'd6 : (system_privilege_fault || io_privilege_fault || halt_privilege_fault) ? 8'd13 :
+    assign system_fault_vector = npx_fault ? 8'd7 : event_vector_limit_fault ? 8'd8 : task_service_fault ? task_service_fault_vector : system_mode_fault ? 8'd6 : (system_privilege_fault || io_privilege_fault || halt_privilege_fault) ? 8'd13 :
                                  arpl_fault ? 8'd6 :
                                  clts_lock_fault ? 8'd6 :
                                  clts_privilege_fault ? 8'd13 :
@@ -1200,6 +1270,17 @@ module spk286_profiled_micro_executor #(parameter bit USE_PARALLEL_SYSTEM_LIMIT 
     assign push_operation = implementation_allowed && operation == spk286_microcode_pkg::MC_PUSH16 && temporary_valid_q[0];
     assign push_event_error = implementation_allowed && operation == spk286_microcode_pkg::MC_PUSH_EVENT_ERROR;
     assign push_transfer = push_operation && push_enabled;
+    // Real mode: a PUSH whose word would start at SS:FFFF first decrements SP
+    // and then raises interrupt 13 without writing.  An Intel N80286-12 left
+    // SP=FFFF and delivered the interrupt below it.  SP is committed first;
+    // the fault follows next cycle.  Event frames were not measured on the
+    // chip and keep the old path.
+    assign real_push_wrap = push_transfer && !protected_msw[0] && !stack_cursor_valid_q && !event_active &&
+                            stack_native_offset == 16'hFFFF && !real_push_wrap_q;
+    always_ff @(posedge clk) begin
+        if (reset || cancel || start || !push_operation) real_push_wrap_q <= 1'b0;
+        else if (real_push_wrap) real_push_wrap_q <= 1'b1;
+    end
     assign push_event_error_transfer = push_event_error && push_enabled && event_error_valid;
     assign iret_outer_required = protected_msw[0] && protected_return_cursor_q &&
                                  temporary_valid_q[1] && (tmp1_q[1:0] > protected_cpl);
@@ -1239,18 +1320,29 @@ module spk286_profiled_micro_executor #(parameter bit USE_PARALLEL_SYSTEM_LIMIT 
     // SP=limit+1, and RETF's immediate adjustment wraps at 16 bits.
     // The explicit SP<frame test handles subtraction underflow. Compare
     // SP with limit+frame directly; that sum fits in 17 bits (frame<=74).
+    // A call gate's frame and parameters may wrap at 16 bits inside an
+    // expand-up stack of limit FFFF, as long as no word starts at FFFF: an
+    // Intel N80286-12 enters the gate with SP=0 on the new stack, and copies
+    // parameters that run from FFFE into 0000. Interrupt delivery keeps the
+    // strict check: there the chip faults even earlier.
+    logic call_gate_frame_wraps_ok, call_parameter_wrap_ok;
+    assign call_gate_frame_wraps_ok = !event_gate_candidate_valid_q && call_ss_limit_q == 16'hFFFF &&
+                                      !call_stack_sp_q[0];
+    assign call_parameter_wrap_ok = stack_segment_limit == 16'hFFFF && !stack_pointer[0];
     assign call_stack_range_fault = check_call_frame && (protected_msw[0] || !event_active) &&
                                    (call_gate_outer_required ?
                                     (!call_stack_ready_q ||
-                                     {1'b0, call_stack_sp_q} < call_gate_frame_bytes ||
                                      (call_ss_access_q[2] ?
-                                      ({1'b0, call_stack_sp_q} <= {1'b0, call_ss_limit_q} + call_gate_frame_bytes) :
-                                      ({1'b0, call_stack_sp_q} > {1'b0, call_ss_limit_q} + 17'd2)) ||
+                                      ({1'b0, call_stack_sp_q} < call_gate_frame_bytes ||
+                                       {1'b0, call_stack_sp_q} <= {1'b0, call_ss_limit_q} + call_gate_frame_bytes) :
+                                      (({1'b0, call_stack_sp_q} < call_gate_frame_bytes && !call_gate_frame_wraps_ok) ||
+                                       {1'b0, call_stack_sp_q} > {1'b0, call_ss_limit_q} + 17'd2)) ||
                                      (call_gate_parameter_count_q != 5'd0 &&
                                       (stack_segment_access[2] ?
                                        ({1'b0, stack_pointer} <= {1'b0, stack_segment_limit} ||
                                         call_parameter_last_byte[16]) :
-                                       (call_parameter_last_byte > {1'b0, stack_segment_limit}))) ) :
+                                       (call_parameter_last_byte[16] ? !call_parameter_wrap_ok :
+                                        call_parameter_last_byte > {1'b0, stack_segment_limit})))) :
                                     (stack_pointer[0] && stack_pointer < 16'd4));
     assign call_gate_stack_switch_begin = call_gate_stack_switch_operation && call_gate_outer_required &&
                                           !call_gate_stack_switch_active_q;
@@ -1269,11 +1361,12 @@ module spk286_profiled_micro_executor #(parameter bit USE_PARALLEL_SYSTEM_LIMIT 
     assign pop_operation = implementation_allowed && (operation == spk286_microcode_pkg::MC_POP16 ||
                                       operation == spk286_microcode_pkg::MC_POP16_TMP1 ||
                                       operation == spk286_microcode_pkg::MC_POP16_TMP2 || iret_outer_pop);
-    // Of the range_fault terms only the IRET outer frame shares an operation
-    // with these stack transfers; the others belong to CHECK_* and string
-    // operations. Testing just that one keeps the unrelated range compares
-    // off the stack request, segment and operand-completion path.
-    assign stack_request = !iret_outer_range_fault &&
+    // Of the range_fault terms only the IRET outer frame and the real-mode
+    // push wrap share an operation with these stack transfers; the others
+    // belong to CHECK_* and string operations. Testing just those keeps the
+    // unrelated range compares off the stack request, segment and
+    // operand-completion path.
+    assign stack_request = !iret_outer_range_fault && !real_push_wrap && !real_push_wrap_q &&
                            (push_transfer || push_event_error_transfer || pop_operation || read_frame_address ||
                             call_gate_stack_write || call_parameter_read || call_parameter_write);
     assign read_ip = implementation_allowed && operation == spk286_microcode_pkg::MC_READ_IP16;
@@ -1510,7 +1603,7 @@ module spk286_profiled_micro_executor #(parameter bit USE_PARALLEL_SYSTEM_LIMIT 
     assign flags_write_en = sequential_flags_write_en || (register_complete && register_alu);
     assign flags_write_data = register_complete && register_alu ? alu_flags : sequential_flags_write_data;
     assign flags_write_mask = register_complete && register_alu ?
-                              decoded_flags_mask & ~decoded_undefined_mask : sequential_flags_write_mask;
+                              decoded_flags_mask : sequential_flags_write_mask;
 
     spk286_alu alu (.operation(alu_operation), .operand_a(reverse_operands ? tmp1_q : tmp0_q), .operand_b(reverse_operands ? tmp0_q : tmp1_q),
                    .carry_in(carry_in), .operand_byte(alu_byte), .result(alu_result), .candidate_flags(alu_flags));
@@ -1560,7 +1653,7 @@ module spk286_profiled_micro_executor #(parameter bit USE_PARALLEL_SYSTEM_LIMIT 
     assign byte_ready = immediate_fetch || fetch_word || fetch_signed_byte || fetch_byte || fetch_byte_tmp1 || (fetch_port && port_immediate) || decode_byte_ready;
     assign operation_done = register_complete || (immediate_last && !immediate_register) || muldiv_complete || write_result_ax || write_result_dx || (fetch_port && (!port_immediate || byte_valid)) || string_empty || string_continue || string_index_write || string_count || string_read_acc || string_write_acc || add_allocation_sp || ((check_push2 || check_pop2) && !range_fault) || frame_read_gpr || frame_write_gpr || save_auxiliary || restore_auxiliary || save_allocation || load_counter ||
                             carry_fill_byte || decrement_counter || counter_branch || begin_stack_cursor || read_stack_cursor || set_frame_address || decrement_frame_address || allocate_stack || set_ea_plus2 ||
-                            ((check_push8 || check_pop8 || check_stack_word || check_rm32 || check_call_frame) && !range_fault) ||
+                            ((check_push8 || check_pop8 || check_stack_word || check_rm32 || check_call_frame) && !range_fault && !stack_limit_fault) ||
                             (call_stack_validation_operation && (!call_gate_outer_required || call_stack_ready_q || (call_tss_operand_done && call_tss_phase_q == 2'd1))) ||
                             (call_gate_stack_switch_operation && (!call_gate_outer_required || (call_gate_stack_write_done && call_gate_stack_switch_phase_q == 2'd1))) ||
                             call_parameter_operation_done ||
@@ -2128,7 +2221,7 @@ module spk286_profiled_micro_executor #(parameter bit USE_PARALLEL_SYSTEM_LIMIT 
                 result_suppress_q <= adjust_complete ? !adjust_write : shift_complete && !shift_write;
                 tmp2_q <= adjust_complete ? adjust_result : shift_complete ? shift_result : alu_result; temporary_valid_q[2] <= 1'b1;
                 flags_q <= adjust_complete ? adjust_flags : shift_complete ? shift_flags : alu_flags;
-                flags_mask_q <= adjust_complete ? adjust_mask : shift_complete ? shift_mask : (decoded_flags_mask & ~decoded_undefined_mask);
+                flags_mask_q <= adjust_complete ? adjust_mask : shift_complete ? shift_mask : decoded_flags_mask;
                 flags_valid_q <= 1'b1; result_disposed_q <= 1'b0;
             end
             if (commit_result && operation_done) begin
