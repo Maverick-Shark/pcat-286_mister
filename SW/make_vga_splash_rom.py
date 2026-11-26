@@ -10,8 +10,15 @@ with red in bits 17:12, green in 11:6 and blue in 5:0. PNG palette components
 are 8-bit, so each is reduced to the 6 bits a VGA DAC holds; author the image
 with components that survive that (v == round(round(v * 63 / 255) * 255 / 63))
 to see on screen exactly what the PNG shows.
+
+"python make_vga_splash_rom.py ch96" packs the Chameleon96 variant instead:
+SW/splash_vga_320x200_ch96.png into rtl/video/splash_vga_320x200_ch96.hex (the
+same picture with "ch96" in place of "MiSTer"; spk286_at_video_adapter.sv loads
+it when MISTER_CHAMELEON96 is defined). It uses the palette of the standard
+picture, so the palette file is not written for a variant.
 """
 
+import sys
 from pathlib import Path
 
 from PIL import Image
@@ -23,8 +30,9 @@ FRAMEBUFFER_BYTES = 65536
 PALETTE_ENTRIES = 256
 
 ROOT = Path(__file__).resolve().parents[1]
-PREVIEW = ROOT / "SW" / "splash_vga_320x200.png"
-PIXELS = ROOT / "rtl" / "video" / "splash_vga_320x200.hex"
+VARIANT = "_" + sys.argv[1] if len(sys.argv) > 1 else ""
+PREVIEW = ROOT / "SW" / f"splash_vga_320x200{VARIANT}.png"
+PIXELS = ROOT / "rtl" / "video" / f"splash_vga_320x200{VARIANT}.hex"
 PALETTE = ROOT / "rtl" / "video" / "splash_vga_palette.hex"
 
 
@@ -52,6 +60,8 @@ def main() -> None:
 
     with PIXELS.open("w", encoding="ascii", newline="\n") as out:
         out.write("".join(f"{value:02X}\n" for value in framebuffer))
+    if VARIANT:
+        return
     with PALETTE.open("w", encoding="ascii", newline="\n") as out:
         out.write("".join(f"{value:05X}\n" for value in entries))
 
