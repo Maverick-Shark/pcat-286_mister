@@ -45,6 +45,7 @@ if the fitter rejects a location or struggles, remove those lines.
 | SDRAM, VGA, analog audio, SDIO, ADC, user port, I/O board | pins | internal nets, tied off |
 | ALSA audio from Linux | yes | no |
 | 350-line CRT conversion (DDR3 capture + 15 kHz raster) | yes | not built |
+| Splash logo / credits title | "MiSTer" (`splash_vga_320x200.hex`, `msg.bin`) | "ch96" (`splash_vga_320x200_ch96.hex`, `msg_ch96.bin`) |
 
 Main_MiSTer reprograms the HDMI PLL for the selected video mode, so the 74.25
 MHz default only sets the power-up clock and the frequency TimeQuest checks.

@@ -79,8 +79,14 @@ module spk286_at_video_adapter (
     // configuration. Once software writes there it is gone until the FPGA is
     // configured again, so a later splash interval (a BIOS reloaded from the
     // OSD) stays black instead of showing whatever the program left.
+    // The Chameleon96 build shows the same picture with "ch96" in place of
+    // "MiSTer" in the logo (SW/make_vga_splash_rom.py ch96).
 `ifdef SPK286_AT_BOOT_SPLASH
+`ifdef MISTER_CHAMELEON96
+    localparam VGA_FRAMEBUFFER_INIT = "splash_vga_320x200_ch96.hex";
+`else
     localparam VGA_FRAMEBUFFER_INIT = "splash_vga_320x200.hex";
+`endif
 `else
     localparam VGA_FRAMEBUFFER_INIT = "";
 `endif
